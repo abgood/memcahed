@@ -1,0 +1,8 @@
+#ifndef MEMCACHED_TRACE_H
+#define MEMCACHED_TRACE_H
+
+#define MEMCACHED_CONN_CREATE(arg0)
+#define MEMCACHED_CONN_DESTROY(arg0)
+#define MEMCACHED_CONN_ALLOCATE(arg0)
+
+#endif

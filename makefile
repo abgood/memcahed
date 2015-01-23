@@ -4,6 +4,8 @@ CFLAGS = -g -O2 -Wall
 
 # 库
 LIBEVENT = -levent
+LIBTHREAD = -lpthread
+LIBSASL = -lsasl2
 
 # 执行文件
 TARGET = memcached
@@ -19,7 +21,7 @@ OBJS = $(patsubst %.c,%.o,$(SOURCES))
 
 # 生成执行文件
 $(TARGET):$(OBJS)
-	$(CC) $(OBJS) -o $@ $(LIBEVENT)
+	$(CC) $(OBJS) -o $@ $(LIBEVENT) $(LIBTHREAD) $(LIBSASL)
 	chmod u+x $@
 
 # 删除.o文件和执行文件
