@@ -566,6 +566,38 @@ static int new_socket(struct addrinfo *ai) {
     return sfd;
 }
 
+static void maximize_sndbuf(const int sfd) {
+    socklen_t intsize = sizeof(int);
+    int last_good = 0;
+    int min, max, avg;
+    int old_size;
+    
+    if (getsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &old_size, &intsize) != 0) {
+        if (settings.verbose > 0) {
+            perror("getsockopt(SO_SNDBUF)");
+        }
+
+        return;
+    }
+
+    min = old_size;
+    max = MAX_SENDBUF_SIZE;
+
+    while (min <= max) {
+        avg = ((unsigned int)(min + max)) / 2;
+        if (setsockopt(sfd, SOL_SOCKET, SO_SNDBUF, (void *)&avg, intsize) == 0) {
+            last_good = avg;
+            min = avg + 1;
+        } else {
+            max = avg - 1;
+        }
+    }
+
+    if (settings.verbose > 1) {
+        fprintf(stderr, "<%d send buffer was %d, now %d\n", sfd, old_size, last_good);
+    }
+}
+
 static int server_socket(const char *interface,
         int port,
         enum network_transport transport,
@@ -619,8 +651,7 @@ static int server_socket(const char *interface,
 
         setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
         if (IS_UDP(transport)) {
-            // maximize_sndbuf(sfd);
-            printf("udp\n");
+            maximize_sndbuf(sfd);
         } else {
             error = setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
             if (error != 0) {
@@ -641,9 +672,64 @@ static int server_socket(const char *interface,
         if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
             printf("haha\n");
         } else {
-            printf("heihei\n");
+            success++;
+            if (!IS_UDP(transport) && listen(sfd, settings.backlog) == -1) {
+                perror("listen()");
+                close(sfd);
+                freeaddrinfo(ai);
+                return 1;
+            }
+
+            if (portnumber_file &&
+                    (next->ai_addr->sa_family == AF_INET ||
+                     next->ai_addr->sa_family == AF_INET6)) {
+                union {
+                    struct sockaddr_in in;
+                    struct sockaddr_in6 in6;
+                } my_sockaddr;
+
+                socklen_t len = sizeof(my_sockaddr);
+
+                if (getsockname(sfd, (struct sockaddr *)&my_sockaddr, &len) == 0) {
+                    if (next->ai_addr->sa_family == AF_INET) {
+                        fprintf(portnumber_file, "%s INET: %u\n",
+                                IS_UDP(transport) ? "UDP" : "TCP",
+                                ntohs(my_sockaddr.in.sin_port));
+                    } else {
+                        fprintf(portnumber_file, "%s INET6: %u\n",
+                                IS_UDP(transport) ? "UDP" : "TCP",
+                                ntohs(my_sockaddr.in6.sin6_port));
+                    }
+                }
+            }
+        }
+
+        if (IS_UDP(transport)) {
+            // printf("udp transport\n");
+            int c;
+
+            for (c = 0; c < settings.num_threads_per_udp; c++) {
+                int per_thread_fd = c ? dup(sfd) : sfd;
+                dispatch_conn_new(per_thread_fd, conn_read,
+                        EV_READ | EV_PERSIST,
+                        UDP_READ_BUFFER_SIZE, transport);
+            }
+        } else {
+            if (!(listen_conn_add = conn_new(sfd, conn_listening,
+                            EV_READ | EV_PERSIST, 1,
+                            transport, main_base))) {
+                fprintf(stderr, "failed to create listening connection\n");
+                exit(EXIT_FAILURE);
+            }
+
+            listen_conn_add->next = listen_conn;
+            listen_conn = listen_conn_add;
         }
     }
+
+    freeaddrinfo(ai);
+
+    return success == 0;
 }
 
 static int server_sockets(int port, enum network_transport transport,
@@ -651,7 +737,40 @@ static int server_sockets(int port, enum network_transport transport,
     if (!settings.inter) {
         return server_socket(settings.inter, port, transport, portnumber_file);
     } else {
-        printf("settings.inter is true\n");
+        char *b;
+        char *p;
+        int ret = 0;
+        char *list = strdup(settings.inter);
+
+        if (!list) {
+            fprintf(stderr, "Failed to allocate memory for parsing server interface string\n");
+            return 1;
+        }
+
+        for (p = strtok_r(list, ";,", &b);
+                p != NULL;
+                p = strtok_r(NULL, ";,", &b)) {
+            int the_port = port;
+            char *s = strchr(p, ':');
+
+            if (s) {
+                *s = '\0';
+                ++s;
+                if (!safe_strtol(s, &the_port)) {
+                    fprintf(stderr, "Invalid port number: \"%s\"", s);
+                    return 1;
+                }
+            }
+
+            if (strcmp(p, "*") == 0) {
+                p = NULL;
+            }
+
+            ret |= server_socket(p, the_port, transport, portnumber_file);
+        }
+
+        free(list);
+        return ret;
     }
 }
 
@@ -1211,6 +1330,13 @@ int main (int argc, char **argv) {
         if (settings.port && server_sockets(settings.port, tcp_transport,
                     portnumber_file)) {
             vperror("failed to listen to TCP port %d", settings.port);
+            exit(EX_OSERR);
+        }
+
+        errno = 0;
+        if (settings.udpport && server_sockets(settings.udpport, udp_transport,
+                    portnumber_file)) {
+            vperror("failed to listen on UDP port %d", settings.udpport);
             exit(EX_OSERR);
         }
 

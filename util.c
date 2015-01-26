@@ -44,3 +44,22 @@ void vperror(const char *fmt, ...) {
     errno = old_errno;
     perror(buf);
 }
+
+bool safe_strtol(const char *str, int32_t *out) {
+    assert(out);
+    errno = 0;
+    *out = 0;
+    char *endptr;
+    long l = strtol(str, &endptr, 10);
+
+    if ((errno == ERANGE) || (str == endptr)) {
+        return false;
+    }
+
+    if (xisspace(*endptr) || (*endptr == '\0' && endptr != str)) {
+        *out = l;
+        return true;
+    }
+
+    return false;
+}

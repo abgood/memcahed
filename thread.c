@@ -202,3 +202,8 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
     pthread_mutex_unlock(&init_lock);
     // printf("%d\n", init_count);
 }
+
+void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
+        int read_buffer_size, enum network_transport transport) {
+    printf("%d\n", sfd);
+}

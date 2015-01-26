@@ -55,6 +55,8 @@
 #define IOV_LIST_INITIAL 400
 #define MSG_LIST_INITIAL 10
 #define IS_UDP(x) (x == udp_transport)
+#define MAX_SENDBUF_SIZE (256 * 1024 * 1024)
+#define UDP_READ_BUFFER_SIZE 65536
 
 typedef unsigned int rel_time_t;
 
@@ -229,6 +231,8 @@ struct conn {
     enum network_transport transport;
     enum conn_states state;
     enum conn_states write_and_go;
+
+    conn *next;
 };
 
 struct slab_stats {
@@ -297,5 +301,6 @@ int sigignore(int);
 void STATS_LOCK(void);
 void STATS_UNLOCK(void);
 void memcached_thread_init(int, struct event_base *);
+void dispatch_conn_new(int, enum conn_states, int, int, enum network_transport);
 
 #endif
