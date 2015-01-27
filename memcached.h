@@ -179,6 +179,47 @@ typedef struct _stritem {
     } data[];
 } item;
 
+struct slab_stats {
+    uint64_t set_cmds;
+    uint64_t get_hits;
+    uint64_t touch_hits;
+    uint64_t delete_hits;
+    uint64_t cas_hits;
+    uint64_t cas_badval;
+    uint64_t incr_hits;
+    uint64_t decr_hits;
+};
+
+struct thread_stats {
+    pthread_mutex_t mutex;
+    uint64_t get_cmds;
+    uint64_t get_misses;
+    uint64_t touch_cmds;
+    uint64_t touch_misses;
+    uint64_t delete_misses;
+    uint64_t incr_misses;
+    uint64_t decr_misses;
+    uint64_t cas_misses;
+    uint64_t bytes_read;
+    uint64_t bytes_written;
+    uint64_t flush_cmds;
+    uint64_t conn_yields;
+    uint64_t auth_cmds;
+    uint64_t auth_errors;
+    struct slab_stats slab_stats[MAX_NUMBER_OF_SLAB_CLASSES];
+};
+
+typedef struct {
+    pthread_t thread_id;
+    struct event_base *base;
+    struct event notify_event;
+    int notify_receive_fd;
+    int notify_send_fd;
+    struct thread_stats stats;
+    struct conn_queue *new_conn_queue;
+    cache_t *suffix_cache;
+} LIBEVENT_THREAD;
+
 typedef struct conn conn;
 struct conn {
     int sfd;
@@ -233,48 +274,8 @@ struct conn {
     enum conn_states write_and_go;
 
     conn *next;
+    LIBEVENT_THREAD *thread;
 };
-
-struct slab_stats {
-    uint64_t set_cmds;
-    uint64_t get_hits;
-    uint64_t touch_hits;
-    uint64_t delete_hits;
-    uint64_t cas_hits;
-    uint64_t cas_badval;
-    uint64_t incr_hits;
-    uint64_t decr_hits;
-};
-
-struct thread_stats {
-    pthread_mutex_t mutex;
-    uint64_t get_cmds;
-    uint64_t get_misses;
-    uint64_t touch_cmds;
-    uint64_t touch_misses;
-    uint64_t delete_misses;
-    uint64_t incr_misses;
-    uint64_t decr_misses;
-    uint64_t cas_misses;
-    uint64_t bytes_read;
-    uint64_t bytes_written;
-    uint64_t flush_cmds;
-    uint64_t conn_yields;
-    uint64_t auth_cmds;
-    uint64_t auth_errors;
-    struct slab_stats slab_stats[MAX_NUMBER_OF_SLAB_CLASSES];
-};
-
-typedef struct {
-    pthread_t thread_id;
-    struct event_base *base;
-    struct event notify_event;
-    int notify_receive_fd;
-    int notify_send_fd;
-    struct thread_stats stats;
-    struct conn_queue *new_conn_queue;
-    cache_t *suffix_cache;
-} LIBEVENT_THREAD;
 
 typedef struct {
     pthread_t thread_id;
@@ -302,5 +303,11 @@ void STATS_LOCK(void);
 void STATS_UNLOCK(void);
 void memcached_thread_init(int, struct event_base *);
 void dispatch_conn_new(int, enum conn_states, int, int, enum network_transport);
+conn *conn_new(const int, enum conn_states, const int, const int, enum network_transport, struct event_base *);
+
+static inline int mutex_lock(pthread_mutex_t *mutex) {
+    while (pthread_mutex_trylock(mutex));
+    return 0;
+}
 
 #endif
