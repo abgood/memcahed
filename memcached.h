@@ -57,6 +57,19 @@
 #define IS_UDP(x) (x == udp_transport)
 #define MAX_SENDBUF_SIZE (256 * 1024 * 1024)
 #define UDP_READ_BUFFER_SIZE 65536
+#define TAIL_REPAIR_TIME_DEFAULT 0
+#define ITEM_LINKED 1
+#define ITEM_CAS 2
+#define mutex_unlock(x) pthread_mutex_unlock(x)
+#define ITEM_SLABBED 4
+#define READ_BUFFER_HIGHWAT 8192
+
+#define ITEM_key(item) (((char *)&((item)->data)) \
+        + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define ITEM_ntotal(item) (sizeof(struct _stritem) + (item)->nkey + 1 \
+        + (item)->nsuffix + (item)->nbytes \
+        + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
 typedef unsigned int rel_time_t;
 
@@ -87,6 +100,21 @@ enum network_transport {
     udp_transport
 };
 
+enum bin_substates {
+    bin_no_state,
+    bin_reading_set_header,
+    bin_reading_cas_header,
+    bin_read_set_value,
+    bin_reading_get_key,
+    bin_reading_stat,
+    bin_reading_del_header,
+    bin_reading_incr_header,
+    bin_read_flush_exptime,
+    bin_reading_sasl_auth,
+    bin_reading_sasl_auth_data,
+    bin_reading_touch_key,
+};
+
 struct settings {
     bool shutdown_command;
     bool use_cas;
@@ -100,6 +128,7 @@ struct settings {
     double factor;
     enum protocol binding_protocol;
     uint32_t lru_crawler_tocrawl;
+    rel_time_t oldest_live;
 
     int access;
     int maxconns;
@@ -272,6 +301,7 @@ struct conn {
     enum network_transport transport;
     enum conn_states state;
     enum conn_states write_and_go;
+    enum bin_substates substate;
 
     conn *next;
     LIBEVENT_THREAD *thread;
@@ -296,6 +326,7 @@ extern struct settings settings;
 extern struct stats stats;
 extern volatile int slab_rebalance_signal;
 extern struct slab_rebalance slab_rebal;
+extern pthread_mutex_t conn_lock;
 
 int daemonize(int, int);
 int sigignore(int);
@@ -304,6 +335,12 @@ void STATS_UNLOCK(void);
 void memcached_thread_init(int, struct event_base *);
 void dispatch_conn_new(int, enum conn_states, int, int, enum network_transport);
 conn *conn_new(const int, enum conn_states, const int, const int, enum network_transport, struct event_base *);
+void drop_privileges(void);
+void accept_new_conns(const bool);
+void do_accept_new_conns(const bool);
+void item_remove(item *);
+void do_item_remove(item *it);
+unsigned short refcount_decr(unsigned short *);
 
 static inline int mutex_lock(pthread_mutex_t *mutex) {
     while (pthread_mutex_trylock(mutex));

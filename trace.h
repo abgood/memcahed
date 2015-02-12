@@ -5,5 +5,7 @@
 #define MEMCACHED_CONN_DESTROY(arg0)
 #define MEMCACHED_CONN_ALLOCATE(arg0)
 #define MEMCACHED_CONN_DISPATCH(arg0, arg1)
+#define MEMCACHED_CONN_RELEASE(arg0)
+#define MEMCACHED_ITEM_REMOVE(arg0, arg1, arg2)
 
 #endif

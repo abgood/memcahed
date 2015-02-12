@@ -25,6 +25,8 @@ pthread_mutex_t cache_lock;
 pthread_mutex_t worker_hang_lock;
 pthread_mutex_t init_lock;
 pthread_mutex_t cqi_freelist_lock;
+pthread_mutex_t atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t init_cond;
 
 static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -341,4 +343,38 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
     if (write(thread->notify_send_fd, buf, 1) != 1) {
         perror("Writing to thread notify pipe");
     }
+}
+
+void accept_new_conns(const bool do_accept) {
+    pthread_mutex_lock(&conn_lock);
+    do_accept_new_conns(do_accept);
+    pthread_mutex_unlock(&conn_lock);
+}
+
+void item_lock(uint32_t hv) {
+    mutex_lock(&item_locks[hv & hashmask(item_lock_hashpower)]);
+}
+
+void item_unlock(uint32_t hv) {
+    mutex_unlock(&item_locks[hv & hashmask(item_lock_hashpower)]);
+}
+
+void item_remove(item *item) {
+    uint32_t hv;
+    hv = hash(ITEM_key(item), item->nkey);
+
+    item_lock(hv);
+    do_item_remove(item);
+    item_unlock(hv);
+}
+
+unsigned short refcount_decr(unsigned short *refcount) {
+    unsigned short res;
+
+    mutex_lock(&atomics_mutex);
+    (*refcount)--;
+    res = *refcount;
+    mutex_unlock(&atomics_mutex);
+
+    return res;
 }

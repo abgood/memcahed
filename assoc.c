@@ -9,10 +9,11 @@ unsigned int hashpower = HASHPOWER_DEFAULT;
 
 static item **primary_hashtable = 0;
 static pthread_mutex_t maintenance_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t maintenance_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t maintenance_tid;
-static bool expanding = false;
 static volatile int do_run_maintenance_thread = 1;
-static unsigned int expand_bucket = 0;
+static bool expanding = false;
+static bool started_expanding = false;
 
 int hash_bulk_move = DEFAULT_HASH_BULK_MOVE;
 
@@ -44,7 +45,9 @@ static void *assoc_maintenance_thread(void *arg) {
         }
 
         if (!expanding) {
-            printf("haha\n");
+            started_expanding = false;
+            pthread_cond_wait(&maintenance_cond, &maintenance_lock);
+            printf("pause_threads\n");
         }
     }
 

@@ -12,6 +12,7 @@ static struct event_base *main_base;
 static int max_fds;
 static struct event clockevent;
 static conn *listen_conn = NULL;
+static volatile bool allow_new_conns = true;
 
 static bool sanitycheck(void) {
     const char *ever = event_get_version();
@@ -37,7 +38,37 @@ static void sig_handler(const int sig) {
 }
 
 static void settings_init(void) {
-    printf("settings_init\n");
+    settings.use_cas = true;
+    settings.access = 0700;
+    settings.port = 11211;
+    settings.udpport = 11211;
+    settings.inter = NULL;
+    settings.maxbytes = 64 * 1024 * 1024;
+    settings.maxconns = 1024;
+    settings.verbose = 0;
+    settings.oldest_live = 0;
+    settings.evict_to_free = 1;
+    settings.socketpath = NULL;
+    settings.factor = 1.25;
+    settings.chunk_size = 48;
+    settings.num_threads = 4;
+    settings.num_threads_per_udp = 0;
+    settings.prefix_delimiter = ':';
+    settings.detail_enabled = 0;
+    settings.reqs_per_event = 20;
+    settings.backlog = 1024;
+    settings.binding_protocol = negotiating_prot;
+    settings.item_size_max = 1024 * 1024;
+    settings.maxconns_fast = false;
+    settings.lru_crawler = false;
+    settings.lru_crawler_sleep = 100;
+    settings.lru_crawler_tocrawl = 0;
+    settings.hashpower_init = 0;
+    settings.slab_reassign = false;
+    settings.slab_automove = 0;
+    settings.shutdown_command = false;
+    settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
+    settings.flush_enabled = true;
 }
 
 static void usage(void) {
@@ -355,8 +386,198 @@ static const char *prot_text(enum protocol prot) {
     return rv;
 }
 
-void event_handler(const int sfd, const short which, void *arg) {
-    printf("event_handler\n");
+static void conn_close(conn *c) {
+    assert(c);
+
+    event_del(&c->event);
+
+    if (settings.verbose > 1) {
+        fprintf(stderr, "<%d connection closed.\n", c->sfd);
+    }
+
+    printf("conn_cleanup\n");
+
+    MEMCACHED_CONN_RELEASE(c->sfd);
+    printf("conn_set_state\n");
+    close(c->sfd);
+
+    pthread_mutex_lock(&conn_lock);
+    allow_new_conns = true;
+    pthread_mutex_unlock(&conn_lock);
+
+    STATS_LOCK();
+    stats.curr_conns--;
+    STATS_UNLOCK();
+
+    return;
+}
+
+void do_accept_new_conns(const bool do_accept) {
+    conn *next;
+
+    for (next = listen_conn; next; next = next->next) {
+        printf("aaa\n");
+    }
+}
+
+static void conn_shrink(conn *c) {
+    assert(c);
+
+    if (IS_UDP(c->transport)) {
+        return;
+    }
+
+    if (c->rsize > READ_BUFFER_HIGHWAT && c->rbytes < DATA_BUFFER_SIZE) {
+        char *newbuf;
+
+        if (c->rcurr != c->rbuf) {
+            memmove(c->rbuf, c->rcurr, (size_t)c->rbytes);
+        }
+
+        newbuf = (char *)realloc((void *))
+    }
+}
+
+static void reset_cmd_handler(conn *c) {
+    c->cmd = -1;
+    c->substate = bin_no_state;
+
+    if (c->item) {
+        item_remove(c->item);
+        c->item = NULL;
+    }
+
+    conn_shrink(c);
+}
+
+static void drive_machine(conn *c) {
+    bool stop = false;
+    int sfd;
+    socklen_t addrlen;
+    struct sockaddr_storage addr;
+    int nreqs = settings.reqs_per_event;
+    int res = 0;
+    const char *str;
+    static int use_accept4 = 0;
+
+    assert(c);
+
+    while (!stop) {
+        switch (c->state) {
+        case conn_listening:
+            addrlen = sizeof(addr);
+            sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+
+            if (sfd == -1) {
+                if (use_accept4 && errno == ENOSYS) {
+                    use_accept4 = 0;
+                    continue;
+                }
+
+                perror(use_accept4 ? "accept4()" : "accept()");
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    stop = true;
+                } else if (errno == EMFILE) {
+                    if (settings.verbose > 0) {
+                        fprintf(stderr, "Too many open connections\n");
+                    }
+
+                    accept_new_conns(false);
+                    stop = true;
+                } else {
+                    perror("accept()");
+                    stop = true;
+                }
+                break;
+            }
+
+            if (!use_accept4) {
+                if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
+                    perror("settings O_NONBLOCK");
+                    close(sfd);
+                    break;
+                }
+            }
+
+            if (settings.maxconns_fast &&
+                stats.curr_conns + stats.reserved_fds >= settings.maxconns - 1) {
+                str = "ERROR Too many open connections\r\n";
+                res = write(sfd, str, strlen(str));
+                close(sfd);
+                STATS_LOCK();
+                stats.rejected_conns++;
+                STATS_UNLOCK();
+            } else {
+                dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
+                        DATA_BUFFER_SIZE, tcp_transport);
+            }
+            stop = true;
+            break;
+
+        case conn_waiting:
+            break;
+
+        case conn_read:
+            break;
+
+        case conn_parse_cmd:
+            break;
+
+        case conn_new_cmd:
+            --nreqs;
+            printf("%d\n", nreqs);
+            if (nreqs >= 0) {
+                reset_cmd_handler(c);
+            } else {
+                printf("nreqs < 0\n");
+                stop = true;
+            }
+            break;
+
+        case conn_nread:
+            break;
+
+        case conn_swallow:
+            break;
+
+        case conn_write:
+            break;
+
+        case conn_mwrite:
+            break;
+
+        case conn_closing:
+            break;
+
+        case conn_closed:
+            break;
+
+        case conn_max_state:
+            break;
+        }
+    }
+
+    return;
+}
+
+void event_handler(const int fd, const short which, void *arg) {
+    conn *c;
+
+    c = (conn *)arg;
+    assert(c);
+
+    if (fd != c->sfd) {
+        if (settings.verbose > 0) {
+            fprintf(stderr, "Catastrophic: event fd doesn't match conn fd!\n");
+        }
+
+        conn_close(c);
+        return;
+    }
+
+    drive_machine(c);
+
+    return;
 }
 
 conn *conn_new(const int sfd, enum conn_states init_state,
@@ -670,7 +891,15 @@ static int server_socket(const char *interface,
         }
 
         if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
-            printf("haha\n");
+            if (errno != EADDRINUSE) {
+                perror("bind()");
+                close(sfd);
+                freeaddrinfo(ai);
+                return 1;
+            }
+
+            close(sfd);
+            continue;
         } else {
             success++;
             if (!IS_UDP(transport) && listen(sfd, settings.backlog) == -1) {
@@ -779,6 +1008,7 @@ int main (int argc, char **argv) {
     int c;
     int maxcore = 0;
     int size_max = 0;
+    int retval = EXIT_SUCCESS;
 
     bool tcp_specified = false;
     bool udp_specified = false;
@@ -1348,14 +1578,21 @@ int main (int argc, char **argv) {
 
     usleep(2000);
 
-
-
-
+    if (stats.curr_conns + stats.reserved_fds >= settings.maxconns - 1) {
+        fprintf(stderr, "Maxconns setting is too low, use -c to increase.\n");
+        exit(EXIT_FAILURE);
+    }
 
     if (pid_file) {
         save_pid(pid_file);
     }
 
+    drop_privileges();
+
+    if (event_base_loop(main_base, 0) != 0) {
+        retval = EXIT_FAILURE;
+    }
+
     printf("memcached done\n");
-    return 0;
+    return retval;
 }
