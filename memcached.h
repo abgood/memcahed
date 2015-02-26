@@ -41,6 +41,7 @@
 #include "slabs.h"
 #include "cache.h"
 #include "trace.h"
+#include "protocol_binary.h"
 
 #define ITEM_UPDATE_INTERVAL 60
 #define HASHPOWER_DEFAULT 16
@@ -63,6 +64,10 @@
 #define mutex_unlock(x) pthread_mutex_unlock(x)
 #define ITEM_SLABBED 4
 #define READ_BUFFER_HIGHWAT 8192
+#define ITEM_LIST_HIGHWAT 400
+#define IOV_LIST_HIGHWAT 600
+#define MSG_LIST_HIGHWAT 100
+#define UDP_HEADER_SIZE 8
 
 #define ITEM_key(item) (((char *)&((item)->data)) \
         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
@@ -267,6 +272,8 @@ struct conn {
     int iovused;
     int msgcurr;
     int msgused;
+    int request_id;
+    int msgbytes;
 
     char *rbuf;
     char *wbuf;
@@ -305,6 +312,7 @@ struct conn {
 
     conn *next;
     LIBEVENT_THREAD *thread;
+    rel_time_t last_cmd_time;
 };
 
 typedef struct {
@@ -341,6 +349,7 @@ void do_accept_new_conns(const bool);
 void item_remove(item *);
 void do_item_remove(item *it);
 unsigned short refcount_decr(unsigned short *);
+void event_handler(const int, const short, void *);
 
 static inline int mutex_lock(pthread_mutex_t *mutex) {
     while (pthread_mutex_trylock(mutex));

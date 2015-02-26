@@ -63,7 +63,7 @@ void item_free(item *it) {
     it->slabs_clsid = 0;
     DEBUG_REFCNT(it, 'F');
     // slabs_free(it, ntotal, clsid);
-    printf("slabs_free\n");
+    printf("slabs_free: %d, %d\n", clsid, (int)ntotal);
 }
 
 void do_item_remove(item *it) {

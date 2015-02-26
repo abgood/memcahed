@@ -14,6 +14,13 @@ static struct event clockevent;
 static conn *listen_conn = NULL;
 static volatile bool allow_new_conns = true;
 
+enum try_read_result {
+    READ_DATA_RECEIVED,
+    READ_NO_DATA_RECEIVED,
+    READ_ERROR,
+    READ_MEMORY_ERROR
+};
+
 static bool sanitycheck(void) {
     const char *ever = event_get_version();
     // current ever is 2.0.21-stable
@@ -434,7 +441,75 @@ static void conn_shrink(conn *c) {
             memmove(c->rbuf, c->rcurr, (size_t)c->rbytes);
         }
 
-        newbuf = (char *)realloc((void *))
+        newbuf = (char *)realloc((void *)c->rbuf, DATA_BUFFER_SIZE);
+
+        if (newbuf) {
+            c->rbuf = newbuf;
+            c->rsize = DATA_BUFFER_SIZE;
+        }
+
+        c->rcurr = c->rbuf;
+    }
+
+    if (c->isize > ITEM_LIST_HIGHWAT) {
+        item **newbuf = (item **)realloc((void *)c->ilist, ITEM_LIST_INITIAL * sizeof(c->ilist[0]));
+        if (newbuf) {
+            c->ilist = newbuf;
+            c->isize = ITEM_LIST_INITIAL;
+        }
+    }
+
+    if (c->msgsize > MSG_LIST_HIGHWAT) {
+        struct msghdr *newbuf = (struct msghdr *)realloc((void *)c->msglist, MSG_LIST_INITIAL * sizeof(c->msglist[0]));
+        if (newbuf) {
+            c->msglist = newbuf;
+            c->msgsize = MSG_LIST_INITIAL;
+        }
+    }
+
+    if (c->iovsize > IOV_LIST_HIGHWAT) {
+        struct iovec *newbuf = (struct iovec *)realloc((void *)c->iov, IOV_LIST_INITIAL * sizeof(c->iov[0]));
+        if (newbuf) {
+            c->iov = newbuf;
+            c->iovsize = IOV_LIST_INITIAL;
+        }
+    }
+}
+
+static const char *state_text(enum conn_states state) {
+    const char *const statenames[] = {
+        "conn_listening",
+        "conn_new_cmd",
+        "conn_waiting",
+        "conn_read",
+        "conn_parse_cmd",
+        "conn_write",
+        "conn_nread",
+        "conn_swallow",
+        "conn_closing",
+        "conn_mwrite",
+        "conn_closed"
+    };
+
+    return statenames[state];
+}
+
+static void conn_set_state(conn *c, enum conn_states state) {
+    assert(c);
+    assert(state >= conn_listening && state < conn_max_state);
+
+    if (state != c->state) {
+        if (settings.verbose > 2) {
+            fprintf(stderr, "%d: going from %s to %s\n",
+                    c->sfd, state_text(c->state),
+                    state_text(state));
+        }
+
+        if (state == conn_write || state == conn_mwrite) {
+            MEMCACHED_PROCESS_COMMAND_END(c->sfd, c->wbuf, c->wbytes);
+        }
+
+        c->state = state;
     }
 }
 
@@ -448,6 +523,298 @@ static void reset_cmd_handler(conn *c) {
     }
 
     conn_shrink(c);
+
+    if (c->rbytes > 0) {
+        conn_set_state(c, conn_parse_cmd);
+    } else {
+        conn_set_state(c, conn_waiting);
+    }
+}
+
+static bool update_event(conn *c, const int new_flags) {
+    assert(c);
+
+    struct event_base *base = c->event.ev_base;
+    if (c->ev_flags == new_flags) {
+        return true;
+    }
+
+    if (event_del(&c->event) == -1) {
+        return false;
+    }
+
+    event_set(&c->event, c->sfd, new_flags, event_handler, (void *)c);
+    event_base_set(base, &c->event);
+    c->ev_flags = new_flags;
+
+    if (event_add(&c->event, 0) == -1) {
+        return false;
+    }
+
+    return true;
+}
+
+static int add_iov(conn *c, const void *buf, int len) {
+    printf("add_iov\n");
+    return 0;
+}
+
+static int add_msghdr(conn *c) {
+    struct msghdr *msg;
+    assert(c);
+
+    if (c->msgsize == c->msgused) {
+        msg = realloc(c->msglist, c->msgsize * 2 * sizeof(struct msghdr));
+        if (!msg) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            return -1;
+        }
+
+        c->msglist = msg;
+        c->msgsize *= 2;
+    }
+
+    msg = c->msglist + c->msgused;
+    memset(msg, 0, sizeof(struct msghdr));
+    msg->msg_iov = &c->iov[c->iovused];
+
+    if (IS_UDP(c->transport) && c->request_addr_size > 0) {
+        msg->msg_name = &c->request_addr;
+        msg->msg_namelen = c->request_addr_size;
+    }
+
+    c->msgbytes = 0;
+    c->msgused++;
+
+    if (IS_UDP(c->transport)) {
+        return add_iov(c, NULL, UDP_HEADER_SIZE);
+    }
+
+    return 0;
+}
+
+static void out_string(conn *c, const char *str) {
+    size_t len;
+    assert(c);
+
+    if (c->noreply) {
+        if (settings.verbose > 1) {
+            fprintf(stderr, ">%d NOREPLY %s\n", c->sfd, str);
+        }
+
+        c->noreply = false;
+        conn_set_state(c, conn_new_cmd);
+        return;
+    }
+
+    if (settings.verbose > 1) {
+        fprintf(stderr, ">%d %s\n", c->sfd, str);
+    }
+
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->iovused = 0;
+    add_msghdr(c);
+
+    len = strlen(str);
+    if ((len + 2) > c->wsize) {
+        str = "SERVER_ERROR output line too long";
+        len = strlen(str);
+    }
+
+    memcpy(c->wbuf, str, len);
+    memcpy(c->wbuf + len, "\r\n", 2);
+    c->wbytes = len + 2;
+    c->wcurr = c->wbuf;
+
+    conn_set_state(c, conn_write);
+    c->write_and_go = conn_new_cmd;
+    return;
+}
+
+static enum try_read_result try_read_udp(conn *c) {
+    int res;
+
+    assert(c);
+    c->request_addr_size = sizeof(c->request_addr);
+    res = recvfrom(c->sfd, c->rbuf, c->rsize,
+            0, (struct sockaddr *)&c->request_addr,
+            &c->request_addr_size);
+
+    if (res > 8) {
+        unsigned char *buf = (unsigned char *)c->rbuf;
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        c->thread->stats.bytes_read += res;
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+
+        c->request_id = buf[0] * 256 + buf[1];
+
+        if (buf[4] != 0 || buf[5] != 1) {
+            out_string(c, "SERVER_ERROR multi-packet request not supported");
+            return READ_NO_DATA_RECEIVED;
+        }
+
+        res -= 8;
+        memmove(c->rbuf, c->rbuf + 8, res);
+
+        c->rbytes = res;
+        c->rcurr = c->rbuf;
+        return READ_DATA_RECEIVED;
+    }
+
+    return READ_NO_DATA_RECEIVED;
+}
+
+static void out_of_memory(conn *c, char *ascii_error) {
+    printf("out_of_memory\n");
+}
+
+static enum try_read_result try_read_network(conn *c) {
+    enum try_read_result gotdata = READ_NO_DATA_RECEIVED;
+    int res;
+    int num_allocs = 0;
+    assert(c);
+
+    if (c->rcurr != c->rbuf) {
+        if (c->rbytes != 0) {
+            memmove(c->rbuf, c->rcurr, c->rbytes);
+        }
+        c->rcurr = c->rbuf;
+    }
+
+    while (1) {
+        if (c->rbytes >= c->rsize) {
+            if (num_allocs == 4) {
+                return gotdata;
+            }
+
+            ++num_allocs;
+            char *new_rbuf = realloc(c->rbuf, c->rsize * 2);
+            if (!new_rbuf) {
+                STATS_LOCK();
+                stats.malloc_fails++;
+                STATS_UNLOCK();
+                if (settings.verbose > 0) {
+                    fprintf(stderr, "Couldn't realloc input buffer\n");
+                }
+
+                c->rbytes = 0;
+                out_of_memory(c, "SERVER_ERROR out of memory reading request");
+                c->write_and_go = conn_closing;
+                return READ_MEMORY_ERROR;
+            }
+
+            c->rcurr = c->rbuf = new_rbuf;
+            c->rsize *= 2;
+        }
+
+        int avail = c->rsize - c->rbytes;
+        res = read(c->sfd, c->rbuf + c->rbytes, avail);
+        if (res > 0) {
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.bytes_read += res;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
+
+            gotdata = READ_DATA_RECEIVED;
+            c->rbytes += res;
+            if (res == avail) {
+                continue;
+            } else {
+                break;
+            }
+        }
+
+        if (res == 0) {
+            return READ_ERROR;
+        }
+
+        if (res == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+
+            return READ_ERROR;
+        }
+    }
+
+    return gotdata;
+}
+
+static void process_command(conn *c, char *command) {
+    token_t tokens[MAX_TOKENS];
+    size_t ntokens;
+    int comm;
+
+    assert(c);
+
+    MEMCACHED_PROCESS_COMMAND_START(c->sfd, c->rcurr, c->rbytes);
+}
+
+static int try_read_command(conn *c) {
+    assert(c);
+    assert(c->rcurr <= (c->rbuf + c->rsize));
+    assert(c->rbytes > 0);
+
+    if (c->protocol == negotiating_prot || c->transport == udp_transport) {
+        if ((unsigned char)c->rbuf[0] == (unsigned char)PROTOCOL_BINARY_REQ) {
+            c->protocol = binary_prot;
+        } else {
+            c->protocol = ascii_prot;
+        }
+
+        if (settings.verbose > 1) {
+            fprintf(stderr, "%d: Client using the %s protocol\n", c->sfd,
+                    prot_text(c->protocol));
+        }
+    }
+
+    if (c->protocol == binary_prot) {
+        printf("binary_prot\n");
+    } else {
+        char *el, *cont;
+
+        if (c->rbytes == 0) {
+            return 0;
+        }
+
+        el = memchr(c->rcurr, '\n', c->rbytes);
+        if (!el) {
+            if (c->rbytes > 1024) {
+                char *ptr = c->rcurr;
+                while (*ptr == ' ') {
+                    ++ptr;
+                }
+
+                if (ptr - c->rcurr > 100 ||
+                        (strncmp(ptr, "get ", 4) && strncmp(ptr, "gets ", 5))) {
+                    conn_set_state(c, conn_closing);
+                    return 1;
+                }
+            }
+
+            return 0;
+        }
+
+        cont = el + 1;
+        if ((el - c->rcurr) > 1 && *(el - 1) == '\r') {
+            el--;
+        }
+        *el = '\0';
+
+        assert(cont <= (c->rcurr + c->rbytes));
+
+        c->last_cmd_time = current_time;
+        process_command(c, c->rcurr);
+
+        c->rbytes -= (cont - c->rcurr);
+        c->rcurr = cont;
+
+        assert(c->rcurr <= (c->rbuf + c->rsize));
+    }
+
+    return 1;
 }
 
 static void drive_machine(conn *c) {
@@ -515,21 +882,70 @@ static void drive_machine(conn *c) {
             break;
 
         case conn_waiting:
+            if (!update_event(c, EV_READ | EV_PERSIST)) {
+                if (settings.verbose > 0) {
+                    fprintf(stderr, "Couldn't update event\n");
+                }
+
+                conn_set_state(c, conn_closing);
+                break;
+            }
+
+            conn_set_state(c, conn_read);
+            stop = true;
             break;
 
         case conn_read:
+            res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);
+
+            switch (res) {
+            case READ_NO_DATA_RECEIVED:
+                printf("read_no_data_received\n");
+                exit(0);
+                break;
+            case READ_DATA_RECEIVED:
+                conn_set_state(c, conn_parse_cmd);
+                break;
+            case READ_ERROR:
+                printf("read_error\n");
+                exit(0);
+                break;
+            case READ_MEMORY_ERROR:
+                printf("read_memory_error\n");
+                exit(0);
+                break;
+            }
+
             break;
 
         case conn_parse_cmd:
+            if (try_read_command(c) == 0) {
+                conn_set_state(c, conn_waiting);
+            }
+
             break;
 
         case conn_new_cmd:
             --nreqs;
-            printf("%d\n", nreqs);
+
             if (nreqs >= 0) {
                 reset_cmd_handler(c);
             } else {
-                printf("nreqs < 0\n");
+                pthread_mutex_lock(&c->thread->stats.mutex);
+                c->thread->stats.conn_yields++;
+                pthread_mutex_unlock(&c->thread->stats.mutex);
+
+                if (c->rbytes > 0) {
+                    if (!update_event(c, EV_WRITE | EV_PERSIST)) {
+                        if (settings.verbose > 0) {
+                            fprintf(stderr, "Couldn't update event\n");
+                        }
+
+                        conn_set_state(c, conn_closing);
+                        break;
+                    }
+                }
+
                 stop = true;
             }
             break;
