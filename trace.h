@@ -8,5 +8,6 @@
 #define MEMCACHED_CONN_RELEASE(arg0)
 #define MEMCACHED_ITEM_REMOVE(arg0, arg1, arg2)
 #define MEMCACHED_PROCESS_COMMAND_END(arg0, arg1, arg2)
+#define MEMCACHED_PROCESS_COMMAND_START(arg0, arg1, arg2)
 
 #endif

@@ -1,5 +1,10 @@
 #include "memcached.h"
 
+#define MAX_TOKENS 8
+#define COMMAND_TOKEN 0
+#define SUBCOMMAND_TOKEN 1
+#define KEY_TOKEN 1
+
 struct settings settings;
 struct stats stats;
 time_t process_started;
@@ -20,6 +25,11 @@ enum try_read_result {
     READ_ERROR,
     READ_MEMORY_ERROR
 };
+
+typedef struct token_s {
+    char *value;
+    size_t length;
+} token_t;
 
 static bool sanitycheck(void) {
     const char *ever = event_get_version();
@@ -555,7 +565,20 @@ static bool update_event(conn *c, const int new_flags) {
 }
 
 static int add_iov(conn *c, const void *buf, int len) {
+    /*
+    struct msghdr *m;
+    int leftover;
+    bool limit_to_mtu;
+
+    assert(c);
+
+    do {
+        m = &c->msglist[c->msgused - 1];
+    } while (leftover > 0);
+    */
+
     printf("add_iov\n");
+
     return 0;
 }
 
@@ -742,6 +765,74 @@ static enum try_read_result try_read_network(conn *c) {
     return gotdata;
 }
 
+static size_t tokenize_command(char *command, token_t *tokens, const size_t max_tokens) {
+    char *s, *e;
+    size_t ntokens = 0;
+    size_t len = strlen(command);
+    unsigned int i = 0;
+
+    assert(command && tokens && max_tokens > 1);
+    s = e = command;
+
+    for (i = 0; i < len; i++) {
+        if (*e == ' ') {
+            if (s != e) {
+                tokens[ntokens].value = s;
+                tokens[ntokens].length = e - s;
+                ntokens++;
+                *e = '\0';
+
+                if (ntokens == max_tokens - 1) {
+                    e++;
+                    s = e;
+                    break;
+                }
+            }
+            s = e + 1;
+        }
+        e++;
+    }
+
+    if (s != e) {
+        tokens[ntokens].value = s;
+        tokens[ntokens].length = e - s;
+        ntokens++;
+    }
+
+    tokens[ntokens].value = *e == '\0' ? NULL : e;
+    tokens[ntokens].length = 0;
+    ntokens++;
+
+    return ntokens;
+}
+
+static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens, bool return_cas) {
+    char *key;
+    size_t nkey;
+    int i = 0;
+    item *it;
+    token_t *key_token = &tokens[KEY_TOKEN];
+    char *suffix;
+    assert(c);
+
+    do {
+        key = key_token->value;
+        nkey = key_token->length;
+
+        if (nkey > KEY_MAX_LENGTH) {
+            out_string(c, "CLIENT_ERROR bad command line format");
+            while (i-- > 0) {
+                item_remove(*(c->ilist + i));
+            }
+            return;
+        }
+
+        it = item_get(key, nkey);
+        break;
+
+    } while (key_token->value);
+}
+
 static void process_command(conn *c, char *command) {
     token_t tokens[MAX_TOKENS];
     size_t ntokens;
@@ -750,6 +841,26 @@ static void process_command(conn *c, char *command) {
     assert(c);
 
     MEMCACHED_PROCESS_COMMAND_START(c->sfd, c->rcurr, c->rbytes);
+
+    if (settings.verbose > 1) {
+        fprintf(stderr, "<%d %s\n", c->sfd, command);
+    }
+
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->iovused = 0;
+    if (add_msghdr(c) != 0) {
+        out_of_memory(c, "SERVER_ERROR out of memory preparing response");
+        return;
+    }
+
+    ntokens = tokenize_command(command, tokens, MAX_TOKENS);
+
+    if (ntokens >= 3 &&
+            (!strcmp(tokens[COMMAND_TOKEN].value, "get") ||
+             !strcmp(tokens[COMMAND_TOKEN].value, "bget"))) {
+        process_get_command(c, tokens, ntokens, false);
+    }
 }
 
 static int try_read_command(conn *c) {

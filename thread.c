@@ -378,3 +378,15 @@ unsigned short refcount_decr(unsigned short *refcount) {
 
     return res;
 }
+
+item *item_get(const char *key, const size_t nkey) {
+    item *it;
+    uint32_t hv;
+
+    hv = hash(key, nkey);
+    item_lock(hv);
+    it = do_item_get(key, nkey, hv);
+    item_unlock(hv);
+
+    return it;
+}

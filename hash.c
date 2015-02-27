@@ -1,4 +1,5 @@
 #include "memcached.h"
+uint32_t jenkins_hash(const void *, size_t);
 
 int hash_init(enum hashfunc_type type) {
     switch (type) {

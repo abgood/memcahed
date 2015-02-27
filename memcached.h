@@ -68,6 +68,7 @@
 #define IOV_LIST_HIGHWAT 600
 #define MSG_LIST_HIGHWAT 100
 #define UDP_HEADER_SIZE 8
+#define KEY_MAX_LENGTH 250
 
 #define ITEM_key(item) (((char *)&((item)->data)) \
         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
@@ -350,6 +351,9 @@ void item_remove(item *);
 void do_item_remove(item *it);
 unsigned short refcount_decr(unsigned short *);
 void event_handler(const int, const short, void *);
+item *item_get(const char *, const size_t);
+item *do_item_get(const char *, const size_t, const uint32_t);
+item *assoc_find(const char *, const size_t, const uint32_t);
 
 static inline int mutex_lock(pthread_mutex_t *mutex) {
     while (pthread_mutex_trylock(mutex));

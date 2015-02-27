@@ -75,3 +75,7 @@ void do_item_remove(item *it) {
         item_free(it);
     }
 }
+
+item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
+    item *it = assoc_find(key, nkey, hv);
+}
